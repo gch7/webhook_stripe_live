@@ -12,95 +12,79 @@ const WHOP_PRODUCT_ID = process.env.WHOP_PRODUCT_ID; // prod_xxx
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // whsec_live_...
 
 // Stripe richiede RAW body per verificare la firma
-app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), (req, res) => {
   let event;
   try {
     event = Stripe.webhooks.constructEvent(
       req.body,
       req.headers["stripe-signature"],
-      STRIPE_WEBHOOK_SECRET
+      process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error("Invalid signature:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  async function grantAccess(email, externalRef) {
-    // 1) get_or_create user su Whop
-    const u = await fetch("https://api.whop.com/api/v1/users/get_or_create", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${WHOP_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ email })
-    });
-    const user = await u.json();
-    if (!u.ok || !user?.id) {
-      console.error("Whop get_or_create user failed:", await u.text());
-      throw new Error("whop_user_error");
+  // 1) ACK immediato (entro 1–2 ms)
+  res.status(200).json({ received: true });
+
+  // 2) Processa in background (fire-and-forget)
+  setImmediate(async () => {
+    try {
+      const type = event.type;
+      const obj = event.data.object;
+
+      const email =
+        obj.customer_email ||
+        obj.customer_details?.email ||
+        obj.receipt_email ||
+        null;
+
+      // helper per chiamare Whop con log
+      const callWhop = async (url, payload) => {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${process.env.WHOP_API_KEY}`,
+            "Content-Type": "application/json",
+            "Idempotency-Key":
+              payload.external_reference || `${Date.now()}-${Math.random()}`
+          },
+          body: JSON.stringify(payload)
+        });
+        const txt = await r.text();
+        console.log("[WHOP]", url, r.status, txt);
+        if (!r.ok) throw new Error(`WHOP ${r.status}: ${txt}`);
+        return JSON.parse(txt);
+      };
+
+      if (type === "checkout.session.completed" || type === "invoice.paid") {
+        if (!email) return console.warn("[WH] no email in event", type);
+        // get_or_create user
+        const user = await callWhop(
+          "https://api.whop.com/api/v1/users/get_or_create",
+          { email }
+        );
+        // create pass
+        await callWhop("https://api.whop.com/api/v1/access_passes", {
+          user_id: user.id,
+          product_id: process.env.WHOP_PRODUCT_ID,
+          external_reference:
+            obj.subscription || obj.id // stabile per rinnovi
+        });
+      } else if (
+        type === "customer.subscription.deleted" ||
+        type === "invoice.payment_failed"
+      ) {
+        await callWhop("https://api.whop.com/api/v1/access_passes/revoke", {
+          external_reference: obj.subscription || obj.id
+        });
+      }
+    } catch (e) {
+      console.error("[WEBHOOK BG ERROR]", e);
     }
+  });
+});
 
-    // 2) crea Access Pass legato al prodotto (delivery Discord già configurato sul prodotto)
-    const p = await fetch("https://api.whop.com/api/v1/access_passes", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${WHOP_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        user_id: user.id,
-        product_id: WHOP_PRODUCT_ID,
-        external_reference: externalRef
-      })
-    });
-
-    if (!p.ok) {
-      const t = await p.text();
-      console.error("Whop create pass failed:", t);
-      throw new Error("whop_pass_error");
-    }
-  }
-
-  async function revokeAccess(externalRef) {
-    const r = await fetch("https://api.whop.com/api/v1/access_passes/revoke", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${WHOP_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ external_reference: externalRef })
-    });
-    if (!r.ok) console.error("Whop revoke failed:", await r.text());
-  }
-
-  try {
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const s = event.data.object;
-        const email = s.customer_details?.email || s.customer_email;
-        if (email) await grantAccess(email, s.id);
-        break;
-      }
-      case "invoice.paid": {
-        const inv = event.data.object;
-        const email = inv.customer_email || inv.customer_details?.email;
-        const ref = inv.subscription || inv.id;
-        if (email) await grantAccess(email, ref);
-        break;
-      }
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
-        await revokeAccess(sub.id);
-        break;
-      }
-      case "invoice.payment_failed": {
-        const inv = event.data.object;
-        const ref = inv.subscription || inv.id;
-        await revokeAccess(ref);
-        break;
-      }
-      default:
         // ignora altri eventi
         break;
     }
